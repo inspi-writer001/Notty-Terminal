@@ -15,9 +15,9 @@ no-entrypoint = []
 init-if-needed = []
 no-idl = []
 no-log-ix-name = []
-idl-build = ["anchor-lang/idl-build"]
+idl-build = ["anchor-lang/idl-build", "anchor-spl/idl-build"]
 
 [dependencies]
-anchor-lang = { version = "0.31.1", features = ["init-if-needed"] }
-anchor-spl = { version = "0.31.0", features = ["metadata"] }
+anchor-lang = { version = "=0.31.0", features = ["init-if-needed"] }
+anchor-spl = { version = "=0.31.0", features = ["metadata"] }
 raydium-launch-cpi = { git = "https://github.com/raydium-io/raydium-cpi", package = "raydium-launch-cpi", branch = "anchor-0.31.0" }

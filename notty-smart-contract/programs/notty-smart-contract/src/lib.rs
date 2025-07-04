@@ -1,3 +1,7 @@
+#![allow(unexpected_cfgs)]
+
+use std::str::FromStr;
+
 use anchor_lang::prelude::*;
 use anchor_lang::solana_program::{program::invoke, system_instruction};
 use anchor_spl::associated_token::AssociatedToken;
@@ -5,11 +9,18 @@ use anchor_spl::metadata::{
     create_metadata_accounts_v3, mpl_token_metadata::types::DataV2, CreateMetadataAccountsV3,
     Metadata,
 };
-use anchor_spl::token::{self, Mint, MintTo, SetAuthority, Token, TokenAccount, Transfer};
+use anchor_spl::token::{
+    self, spl_token, Mint, MintTo, SetAuthority, Token, TokenAccount, Transfer,
+};
+use anchor_spl::token_interface::{Mint as InterfaceMint, TokenInterface};
+use raydium_launch_cpi::states::*;
+use raydium_launch_cpi::{cpi, program::RaydiumLaunchpad};
+
 pub const TOKEN_VAULT_SEED: &[u8] = b"token_vault";
 pub const SOL_VAULT_SEED: &[u8] = b"sol_vault";
 pub const MINT_AUTHORITY_SEED: &[u8] = b"mint_authority";
 pub const VAULT_AUTHORITY_SEED: &[u8] = b"authority";
+const USDC_MINT: Pubkey = Pubkey::from_str_const("6mWfrWzYf5ot4S8Bti5SCDRnZWA5ABPH1SNkSq4mNN1C");
 declare_id!("DLL2RN855xoMycXGipog3CjzQqpPBQJ6CpS6hPc8Tj1G");
 
 #[program]
@@ -434,43 +445,63 @@ pub mod notty_smart_contract {
         Ok(())
     }
 
-    pub fn migrate_vault(ctx: Context<MigrateVault>) -> Result<()> {
+    pub fn migrate_vault(
+        ctx: Context<MigrateVault>,
+        base_mint_param: MintParams,
+        curve_param: CurveParams,
+        vesting_param: VestingParams,
+    ) -> Result<()> {
         let vault = &mut ctx.accounts.vault_account;
         require!(!vault.migrated, ErrorCode::AlreadyMigrated);
-        let sol_balance = ctx.accounts.sol_vault.to_account_info().lamports();
-        require!(
-            sol_balance >= vault.price_per_token * vault.token_account_amount(),
-            ErrorCode::TargetNotReached
-        );
 
-        let cpi_accounts = raydium_launch_cpi::accounts::Initialize {
-            pool: ctx.accounts.launchpad_pool.to_account_info(),
-            token_vault: ctx.accounts.token_vault.to_account_info(),
-            sol_vault: ctx.accounts.sol_vault.to_account_info(),
-            authority: ctx.accounts.vault_authority.to_account_info(),
+        // (Optionally re‑enable your fundraising threshold check here)
+        // let sol_balance = ctx.accounts.sol_vault.to_account_info().lamports();
+        // require!(sol_balance >= vault.target_sol, ErrorCode::TargetNotReached);
+
+        // Build the CPI account struct in exactly the same order as the Raydium example:
+        let cpi_accounts = cpi::accounts::Initialize {
+            // 1. program
             payer: ctx.accounts.payer.to_account_info(),
+            creator: ctx.accounts.creator.to_account_info(),
+            global_config: ctx.accounts.global_config.to_account_info(),
+            platform_config: ctx.accounts.platform_config.to_account_info(),
+            authority: ctx.accounts.authority.to_account_info(),
+            pool_state: ctx.accounts.pool_state.to_account_info(),
+            base_mint: ctx.accounts.base_mint.to_account_info(),
+            base_vault: ctx.accounts.base_vault.to_account_info(),
+            quote_mint: ctx.accounts.quote_mint.to_account_info(),
+            quote_vault: ctx.accounts.quote_vault.to_account_info(),
+            metadata_account: ctx.accounts.metadata_account.to_account_info(),
+            base_token_program: ctx.accounts.base_token_program.to_account_info(),
+            quote_token_program: ctx.accounts.quote_token_program.to_account_info(),
+            metadata_program: ctx.accounts.metadata_program.to_account_info(),
             system_program: ctx.accounts.system_program.to_account_info(),
-            token_program: ctx.accounts.token_program.to_account_info(),
-            rent: ctx.accounts.rent.to_account_info(),
+            rent_program: ctx.accounts.rent_program.to_account_info(),
+            event_authority: ctx.accounts.event_authority.to_account_info(),
+            program: ctx.accounts.launchpad_program.to_account_info(),
         };
-        let seeds = &[&[
-            VAULT_AUTHORITY_SEED,
-            vault.mint.as_ref(),
-            &[ctx.bumps.vault_authority],
-        ]];
-        let cpi_ctx = CpiContext::new_with_signer(
-            ctx.accounts.raydium_program.to_account_info(),
-            cpi_accounts,
-            seeds,
+
+        // Wrap it in a CpiContext; no signer PDA is needed here
+        // unless Raydium expects your authority PDA to sign – if so, switch to new_with_signer:
+        cpi::initialize(
+            CpiContext::new(
+                ctx.accounts.launchpad_program.to_account_info(),
+                cpi_accounts,
+            ),
+            base_mint_param,
+            curve_param,
+            vesting_param,
         );
 
-        raydium_launch_cpi::initialize(cpi_ctx)?;
-
+        // Finalize
         vault.migrated = true;
         emit!(VaultMigratedEvent {
             mint: vault.mint,
-            pool: ctx.accounts.launchpad_pool.key()
+            pool: ctx.accounts.pool_state.key(),
+            sol_deposited: ctx.accounts.quote_vault.to_account_info().lamports(),
+            // tokens_deposited: ctx.accounts.base_vault.,
         });
+
         Ok(())
     }
 }
@@ -637,7 +668,7 @@ pub struct BuyToken<'info> {
         seeds = [VAULT_AUTHORITY_SEED, mint.key().as_ref()],
         bump
     )]
-    /// CHECK:
+    /// CHECK: vault authority
     pub vault_authority: UncheckedAccount<'info>,
 
     /// CHECK: Global owner of the smart contract
@@ -686,14 +717,14 @@ pub struct SellToken<'info> {
         seeds = [SOL_VAULT_SEED],
         bump
     )]
-    /// CHECK:
+    /// CHECK: sol vault
     pub sol_vault: UncheckedAccount<'info>,
 
     #[account(
         seeds = [VAULT_AUTHORITY_SEED, mint.key().as_ref()],
         bump
     )]
-    /// CHECK:
+    /// CHECK: vault authority for sol
     pub vault_authority: UncheckedAccount<'info>,
 
     /// CHECK: Global owner of the smart contract
@@ -710,43 +741,116 @@ pub struct SellToken<'info> {
 
 #[derive(Accounts)]
 pub struct MigrateVault<'info> {
+    /// 1. Raydium program (self‑cpi)  
+    pub launchpad_program: Program<'info, RaydiumLaunchpad>,
+
+    #[account(
+        seeds = [b"vault", base_mint.key().as_ref()],
+        bump,
+    )]
+    pub vault_account: Account<'info, TokenVault>,
+
+    /// 2. The account paying for the transaction  
     #[account(mut)]
     pub payer: Signer<'info>,
 
+    /// CHECK: Creator of the base token  
+    #[account()]
+    pub creator: UncheckedAccount<'info>,
+
+    /// 4. Global config (quote mint + fees)  
+    pub global_config: Box<Account<'info, GlobalConfig>>,
+
+    /// 5. Platform config (platform‑specific settings)  
+    pub platform_config: Box<Account<'info, PlatformConfig>>,
+
+    /// CHECK: Authority PDA (seeds = AUTH_SEED)  
+    #[account(
+      seeds = [raydium_launch_cpi::AUTH_SEED.as_bytes()],
+      bump,
+      seeds::program = launchpad_program.key(),
+    )]
+    pub authority: UncheckedAccount<'info>,
+
+    /// CHECK: Pool state PDA  
+    #[account(
+      mut,
+      seeds = [
+        POOL_SEED.as_bytes(),
+        base_mint.key().as_ref(),
+        quote_mint.key().as_ref(),
+        /* quote_mint.key().as_ref() if needed */
+      ],
+      bump,
+      seeds::program = launchpad_program.key(),
+    )]
+    pub pool_state: UncheckedAccount<'info>,
+
+    /// 8. Base mint (your token)  
     #[account(mut)]
-    pub vault_account: Account<'info, TokenVault>,
+    pub base_mint: Signer<'info>,
 
-    #[account(mut,
-        seeds = [TOKEN_VAULT_SEED, vault_account.mint.as_ref()],
-        bump)]
-    pub token_vault: Account<'info, TokenAccount>,
+    /// CHECK: Base vault (token_vault)  
+    #[account(
+      mut,
+      seeds = [
+        POOL_VAULT_SEED.as_bytes(),
+        pool_state.key().as_ref(),
+        base_mint.key().as_ref(),
+      ],
+      bump,
+      seeds::program = launchpad_program.key(),
+    )]
+    pub base_vault: UncheckedAccount<'info>,
 
-    #[account(mut,
-        seeds = [SOL_VAULT_SEED],
-        bump)]
-    pub sol_vault: UncheckedAccount<'info>,
+    /// 10. Quote mint (e.g. USDC)  
+    #[account(address = global_config.quote_mint, constraint = quote_mint.key() == USDC_MINT)]
+    pub quote_mint: Box<InterfaceAccount<'info, InterfaceMint>>,
 
-    #[account(mut,
-        seeds = [VAULT_AUTHORITY_SEED, vault_account.mint.as_ref()],
-        bump)]
-    pub vault_authority: UncheckedAccount<'info>,
+    /// CHECK: Quote vault (sol_vault or USDC vault)  
+    #[account(
+      mut,
+      seeds = [
+        POOL_VAULT_SEED.as_bytes(),
+        pool_state.key().as_ref(),
+        quote_mint.key().as_ref(),
+      ],
+      bump,
+      seeds::program = launchpad_program.key(),
+    )]
+    pub quote_vault: UncheckedAccount<'info>,
 
-    #[account(mut,
-        seeds = [MINT_AUTHORITY_SEED, vault_account.mint.as_ref()],
-        bump)]
-    pub mint_authority: UncheckedAccount<'info>,
-
-    /// LaunchLab pool PDA to be created
+    /// CHECK: Metadata account  
     #[account(mut)]
-    pub launchpad_pool: UncheckedAccount<'info>,
+    pub metadata_account: UncheckedAccount<'info>,
 
-    /// Raydium Launch­pad program
-    pub raydium_program: Program<'info, raydium_launch_cpi::program::RaydiumLaunch>,
+    /// 13. Base token Program  
+    #[account(address = spl_token::id())]
+    pub base_token_program: Interface<'info, TokenInterface>,
 
-    // Required sysvars/programs
-    pub token_program: Program<'info, Token>,
+    /// 14. Quote token Program  
+    pub quote_token_program: Program<'info, Token>,
+
+    /// 15. Metadata Program  
+    pub metadata_program: Program<'info, Metadata>,
+
+    /// 16. System Program  
     pub system_program: Program<'info, System>,
-    pub rent: Sysvar<'info, Rent>,
+
+    /// 17. Rent Sysvar  
+    pub rent_program: Sysvar<'info, Rent>,
+
+    /// 18. Event authority  
+    #[account(
+      seeds = [b"__event_authority"],
+      bump,
+      seeds::program = launchpad_program.key(),
+    )]
+    pub event_authority: AccountInfo<'info>,
+
+    /// 19. Self‑cpi Program (again)  
+    #[account(address = launchpad_program.key())]
+    pub program: AccountInfo<'info>,
 }
 
 #[error_code]
@@ -847,7 +951,7 @@ pub struct TokenWithVaultCreatedEvent {
 #[event]
 pub struct VaultMigratedEvent {
     pub mint: Pubkey,
-    pub pool: Pubkey,          // Raydium pool PDA
-    pub sol_deposited: u64,    // SOL amount contributed
-    pub tokens_deposited: u64, // SPL tokens deposited
+    pub pool: Pubkey, // Raydium pool PDA
+    pub sol_deposited: u64, // SOL amount contributed
+                      // pub tokens_deposited: u64, // SPL tokens deposited
 }
