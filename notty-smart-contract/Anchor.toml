@@ -4,14 +4,14 @@
 resolution = true
 skip-lint = false
 
-[programs.localnet]
-notty_smart_contract = "4fDf77JCNQvjZ9WnsYVpfPVt9KttsCEoC4crwtEk3aqJ"
+[programs.devnet]
+notty_smart_contract = "DLL2RN855xoMycXGipog3CjzQqpPBQJ6CpS6hPc8Tj1G"
 
 [registry]
 url = "https://api.apr.dev"
 
 [provider]
-cluster = "Localnet"
+cluster = "Devnet"
 wallet = "~/.config/solana/id.json"
 
 [scripts]

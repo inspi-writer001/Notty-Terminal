@@ -10,7 +10,7 @@ pub const TOKEN_VAULT_SEED: &[u8] = b"token_vault";
 pub const SOL_VAULT_SEED: &[u8] = b"sol_vault";
 pub const MINT_AUTHORITY_SEED: &[u8] = b"mint_authority";
 pub const VAULT_AUTHORITY_SEED: &[u8] = b"authority";
-declare_id!("4fDf77JCNQvjZ9WnsYVpfPVt9KttsCEoC4crwtEk3aqJ");
+declare_id!("DLL2RN855xoMycXGipog3CjzQqpPBQJ6CpS6hPc8Tj1G");
 
 #[program]
 pub mod notty_smart_contract {
@@ -50,10 +50,13 @@ pub mod notty_smart_contract {
             true,
             None,
         )?;
-        // Transfer mint authority from payer to the PDA
-        let mint_key = ctx.accounts.mint_account.key();
-        let (mint_authority, _) =
-            Pubkey::find_program_address(&[MINT_AUTHORITY_SEED, mint_key.as_ref()], ctx.program_id);
+
+        // Transfer mint authority from payer to the PDA -
+
+        // inspiration removed expensive onchain logic
+        // let mint_key = ctx.accounts.mint_account.key();
+        // let (mint_authority, _) =
+        //     Pubkey::find_program_address(&[MINT_AUTHORITY_SEED, mint_key.as_ref()], ctx.program_id);
 
         let cpi_accounts = SetAuthority {
             account_or_mint: ctx.accounts.mint_account.to_account_info(),
@@ -65,7 +68,7 @@ pub mod notty_smart_contract {
         token::set_authority(
             cpi_ctx,
             token::spl_token::instruction::AuthorityType::MintTokens,
-            Some(mint_authority),
+            Some(ctx.accounts.mint_authority.key()),
         )?;
 
         emit!(TokenCreatedEvent {
@@ -184,7 +187,7 @@ pub mod notty_smart_contract {
             let transfer_ctx = CpiContext::new_with_signer(
                 ctx.accounts.token_program.to_account_info(),
                 token_transfer_accounts,
-                seed_ref
+                seed_ref,
             );
 
             token::transfer(transfer_ctx, forty_percent)?;
@@ -251,128 +254,6 @@ pub mod notty_smart_contract {
         Ok(())
     }
 
-    // pub fn buy_token(ctx: Context<BuyToken>, amount: u64) -> Result<()> {
-    //     let decimals = ctx.accounts.mint.decimals;
-    //     let divisor = 10u64.pow(decimals as u32);
-
-    //     let total_cost = ctx
-    //         .accounts
-    //         .vault_account
-    //         .price_per_token
-    //         .checked_mul(amount as u64)
-    //         .unwrap()
-    //         / divisor;
-
-    //     // Ensure buyer has enough funds
-    //     require!(
-    //         ctx.accounts.buyer.lamports() >= total_cost,
-    //         ErrorCode::InsufficientFunds
-    //     );
-
-    //     // Transfer SOL from buyer to sol_vault using system program
-    //     let transfer_ix = system_instruction::transfer(
-    //         &ctx.accounts.buyer.key(),
-    //         &ctx.accounts.sol_vault.key(),
-    //         total_cost,
-    //     );
-
-    //     invoke(
-    //         &transfer_ix,
-    //         &[
-    //             ctx.accounts.buyer.to_account_info(),
-    //             ctx.accounts.sol_vault.to_account_info(),
-    //         ],
-    //     )?;
-
-    //     // Prepare for SPL token transfer (token_vault -> buyer_token_account)
-    //     let cpi_accounts = Transfer {
-    //         from: ctx.accounts.token_vault.to_account_info(),
-    //         to: ctx.accounts.buyer_token_account.to_account_info(),
-    //         authority: ctx.accounts.vault_authority.to_account_info(),
-    //     };
-
-    //     let mint_key = ctx.accounts.mint.key();
-    //     let authority_seeds: &[&[u8]] = &[
-    //         VAULT_AUTHORITY_SEED,
-    //         mint_key.as_ref(),
-    //         &[ctx.bumps.vault_authority],
-    //     ];
-    //     let signer_seeds: &[&[&[u8]]] = &[authority_seeds];
-
-    //     let cpi_ctx = CpiContext::new_with_signer(
-    //         ctx.accounts.token_program.to_account_info(),
-    //         cpi_accounts,
-    //         signer_seeds,
-    //     );
-    //     token::transfer(cpi_ctx, amount)?;
-
-    //     emit!(TokenTransferEvent {
-    //         transfer_type: 0, // buy :0 sell:1
-    //         mint_address: ctx.accounts.mint.key(),
-    //         user: ctx.accounts.buyer.key(),
-    //         sol_amount: total_cost,
-    //         coin_amount: amount,
-    //     });
-
-    //     Ok(())
-    // }
-
-    // pub fn sell_token(ctx: Context<SellToken>, amount: u64) -> Result<()> {
-    //     let decimals = ctx.accounts.mint.decimals;
-    //     let divisor = 10u64.pow(decimals as u32);
-
-    //     let total_refund = ctx
-    //         .accounts
-    //         .vault_account
-    //         .price_per_token
-    //         .checked_mul(amount as u64)
-    //         .unwrap()
-    //         / divisor;
-
-    //     // Check the SOL vault has enough lamports
-    //     require!(
-    //         ctx.accounts.sol_vault.lamports() >= total_refund,
-    //         ErrorCode::VaultInsufficientSol
-    //     );
-
-    //     // Transfer tokens from seller to vault
-    //     let cpi_accounts = Transfer {
-    //         from: ctx.accounts.seller_token_account.to_account_info(),
-    //         to: ctx.accounts.token_vault.to_account_info(),
-    //         authority: ctx.accounts.seller.to_account_info(),
-    //     };
-    //     let cpi_ctx = CpiContext::new(ctx.accounts.token_program.to_account_info(), cpi_accounts);
-    //     token::transfer(cpi_ctx, amount)?;
-
-    //     // Transfer SOL back to the seller using invoke_signed
-    //     let ix = anchor_lang::solana_program::system_instruction::transfer(
-    //         ctx.accounts.sol_vault.key,
-    //         ctx.accounts.seller.key,
-    //         total_refund,
-    //     );
-
-    //     let vault_seed = &[SOL_VAULT_SEED, &[ctx.bumps.sol_vault]];
-
-    //     anchor_lang::solana_program::program::invoke_signed(
-    //         &ix,
-    //         &[
-    //             ctx.accounts.sol_vault.to_account_info(),
-    //             ctx.accounts.seller.to_account_info(),
-    //             ctx.accounts.system_program.to_account_info(),
-    //         ],
-    //         &[vault_seed],
-    //     )?;
-
-    //     emit!(TokenTransferEvent {
-    //         transfer_type: 1, // buy:0 sell:1
-    //         mint_address: ctx.accounts.mint.key(),
-    //         user: ctx.accounts.seller.key(),
-    //         sol_amount: total_refund,
-    //         coin_amount: amount,
-    //     });
-
-    //     Ok(())
-    // }
     pub fn sell_token(ctx: Context<SellToken>, amount: u64) -> Result<()> {
         let decimals = ctx.accounts.mint.decimals;
         let divisor = 10u64.pow(decimals as u32);
@@ -553,6 +434,45 @@ pub mod notty_smart_contract {
         Ok(())
     }
 
+    pub fn migrate_vault(ctx: Context<MigrateVault>) -> Result<()> {
+        let vault = &mut ctx.accounts.vault_account;
+        require!(!vault.migrated, ErrorCode::AlreadyMigrated);
+        let sol_balance = ctx.accounts.sol_vault.to_account_info().lamports();
+        require!(
+            sol_balance >= vault.price_per_token * vault.token_account_amount(),
+            ErrorCode::TargetNotReached
+        );
+
+        let cpi_accounts = raydium_launch_cpi::accounts::Initialize {
+            pool: ctx.accounts.launchpad_pool.to_account_info(),
+            token_vault: ctx.accounts.token_vault.to_account_info(),
+            sol_vault: ctx.accounts.sol_vault.to_account_info(),
+            authority: ctx.accounts.vault_authority.to_account_info(),
+            payer: ctx.accounts.payer.to_account_info(),
+            system_program: ctx.accounts.system_program.to_account_info(),
+            token_program: ctx.accounts.token_program.to_account_info(),
+            rent: ctx.accounts.rent.to_account_info(),
+        };
+        let seeds = &[&[
+            VAULT_AUTHORITY_SEED,
+            vault.mint.as_ref(),
+            &[ctx.bumps.vault_authority],
+        ]];
+        let cpi_ctx = CpiContext::new_with_signer(
+            ctx.accounts.raydium_program.to_account_info(),
+            cpi_accounts,
+            seeds,
+        );
+
+        raydium_launch_cpi::initialize(cpi_ctx)?;
+
+        vault.migrated = true;
+        emit!(VaultMigratedEvent {
+            mint: vault.mint,
+            pool: ctx.accounts.launchpad_pool.key()
+        });
+        Ok(())
+    }
 }
 
 #[event]
@@ -589,8 +509,8 @@ pub struct CreateToken<'info> {
         init,
         payer = payer,
         mint::decimals = 9,
-        mint::authority = payer.key(),
-        mint::freeze_authority = payer.key(),
+        mint::authority = payer,
+        mint::freeze_authority = payer,
     )]
     pub mint_account: Account<'info, Mint>,
 
@@ -602,6 +522,10 @@ pub struct CreateToken<'info> {
         seeds::program = token_metadata_program.key(),
     )]
     pub metadata_account: UncheckedAccount<'info>,
+
+    #[account(seeds=[MINT_AUTHORITY_SEED, mint_account.key().as_ref()], bump)]
+    /// CHECK: this is our PDA mint authority
+    pub mint_authority: UncheckedAccount<'info>,
 
     pub token_program: Program<'info, Token>,
     pub token_metadata_program: Program<'info, Metadata>,
@@ -616,6 +540,7 @@ pub struct TokenVault {
     pub token_account: Pubkey,
     pub sol_vault: Pubkey,
     pub price_per_token: u64,
+    pub migrated: bool,
 }
 
 #[derive(Accounts)]
@@ -783,14 +708,59 @@ pub struct SellToken<'info> {
     pub system_program: Program<'info, System>,
 }
 
+#[derive(Accounts)]
+pub struct MigrateVault<'info> {
+    #[account(mut)]
+    pub payer: Signer<'info>,
+
+    #[account(mut)]
+    pub vault_account: Account<'info, TokenVault>,
+
+    #[account(mut,
+        seeds = [TOKEN_VAULT_SEED, vault_account.mint.as_ref()],
+        bump)]
+    pub token_vault: Account<'info, TokenAccount>,
+
+    #[account(mut,
+        seeds = [SOL_VAULT_SEED],
+        bump)]
+    pub sol_vault: UncheckedAccount<'info>,
+
+    #[account(mut,
+        seeds = [VAULT_AUTHORITY_SEED, vault_account.mint.as_ref()],
+        bump)]
+    pub vault_authority: UncheckedAccount<'info>,
+
+    #[account(mut,
+        seeds = [MINT_AUTHORITY_SEED, vault_account.mint.as_ref()],
+        bump)]
+    pub mint_authority: UncheckedAccount<'info>,
+
+    /// LaunchLab pool PDA to be created
+    #[account(mut)]
+    pub launchpad_pool: UncheckedAccount<'info>,
+
+    /// Raydium Launch­pad program
+    pub raydium_program: Program<'info, raydium_launch_cpi::program::RaydiumLaunch>,
+
+    // Required sysvars/programs
+    pub token_program: Program<'info, Token>,
+    pub system_program: Program<'info, System>,
+    pub rent: Sysvar<'info, Rent>,
+}
+
 #[error_code]
 pub enum ErrorCode {
     #[msg("Not enough SOL to buy tokens")]
     InsufficientFunds,
     #[msg("Vault doesn't have enough SOL to refund")]
     VaultInsufficientSol,
-     #[msg("Numerical overflow occurred.")]
+    #[msg("Numerical overflow occurred.")]
     NumericalOverflow,
+    #[msg("Liquidity has already been migrated")]
+    AlreadyMigrated,
+    #[msg("Vault hasn't reached the migration threshold")]
+    TargetNotReached,
 }
 
 #[derive(Accounts)]
@@ -872,4 +842,12 @@ pub struct TokenWithVaultCreatedEvent {
     pub decimals: u8,
     pub initial_supply: u64,
     pub price_per_token: u64,
+}
+
+#[event]
+pub struct VaultMigratedEvent {
+    pub mint: Pubkey,
+    pub pool: Pubkey,          // Raydium pool PDA
+    pub sol_deposited: u64,    // SOL amount contributed
+    pub tokens_deposited: u64, // SPL tokens deposited
 }
