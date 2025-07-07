@@ -21,6 +21,7 @@ pub const SOL_VAULT_SEED: &[u8] = b"sol_vault";
 pub const MINT_AUTHORITY_SEED: &[u8] = b"mint_authority";
 pub const VAULT_AUTHORITY_SEED: &[u8] = b"authority";
 pub const FEE_VAULT_SEED: &[u8] = b"fee_vault";
+pub const GLOBAL_STATE_SEED: &[u8] = b"global_state";
 
 // Bonding curve constants
 pub const TOTAL_SUPPLY: u64 = 1_000_000_000_000_000_000; // 1B tokens with 9 decimals
@@ -31,11 +32,96 @@ pub const CREATION_FEE_SOL: u64 = 50_000_000; // 0.05 SOL in lamports
 const USDC_MINT: Pubkey = Pubkey::from_str_const("6mWfrWzYf5ot4S8Bti5SCDRnZWA5ABPH1SNkSq4mNN1C");
 declare_id!("DLL2RN855xoMycXGipog3CjzQqpPBQJ6CpS6hPc8Tj1G");
 
+#[account]
+pub struct GlobalState {
+    pub admin: Pubkey,
+    pub total_fees_collected: u64,
+    pub total_tokens_created: u64,
+}
+
 #[program]
 pub mod notty_smart_contract {
     use anchor_lang::solana_program::program::invoke_signed;
 
     use super::*;
+
+    pub fn initialize(ctx: Context<Initialize>, admin: Pubkey) -> Result<()> {
+        let global_state = &mut ctx.accounts.global_state;
+        global_state.admin = admin;
+        global_state.total_fees_collected = 0;
+        global_state.total_tokens_created = 0;
+
+        emit!(ProgramInitializedEvent {
+            admin: admin,
+            fee_vault: ctx.accounts.fee_vault.key(),
+        });
+
+        Ok(())
+    }
+
+    // Admin function to update the admin (transfer ownership)
+    pub fn update_admin(ctx: Context<UpdateAdmin>, new_admin: Pubkey) -> Result<()> {
+        let global_state = &mut ctx.accounts.global_state;
+
+        // Only current admin can update
+        require!(
+            ctx.accounts.current_admin.key() == global_state.admin,
+            ErrorCode::UnauthorizedAdmin
+        );
+
+        let old_admin = global_state.admin;
+        global_state.admin = new_admin;
+
+        emit!(AdminUpdatedEvent {
+            old_admin: old_admin,
+            new_admin: new_admin,
+        });
+
+        Ok(())
+    }
+
+    pub fn get_fee_vault_balance(ctx: Context<GetFeeVaultBalance>) -> Result<u64> {
+        Ok(ctx.accounts.fee_vault.lamports())
+    }
+
+    // Admin-only function to withdraw accumulated fees
+    pub fn withdraw_fees(ctx: Context<WithdrawFees>, amount: u64) -> Result<()> {
+        let global_state = &ctx.accounts.global_state;
+
+        // Only admin can withdraw
+        require!(
+            ctx.accounts.admin.key() == global_state.admin,
+            ErrorCode::UnauthorizedAdmin
+        );
+
+        // Check if fee vault has enough SOL
+        require!(
+            ctx.accounts.fee_vault.lamports() >= amount,
+            ErrorCode::InsufficientFeeVaultBalance
+        );
+
+        // Transfer SOL from fee vault to admin
+        invoke_signed(
+            &system_instruction::transfer(
+                &ctx.accounts.fee_vault.key(),
+                &ctx.accounts.admin.key(),
+                amount,
+            ),
+            &[
+                ctx.accounts.fee_vault.to_account_info(),
+                ctx.accounts.admin.to_account_info(),
+            ],
+            &[&[FEE_VAULT_SEED, &[ctx.bumps.fee_vault]]],
+        )?;
+
+        emit!(FeesWithdrawnEvent {
+            admin: ctx.accounts.admin.key(),
+            amount: amount,
+            fee_vault_remaining: ctx.accounts.fee_vault.lamports() - amount,
+        });
+
+        Ok(())
+    }
 
     // UPDATED: Create bonding curve token with proper economics
     pub fn create_bonding_curve_token(
@@ -184,8 +270,8 @@ pub mod notty_smart_contract {
         require!(tokens_to_buy > 0, ErrorCode::InvalidAmount);
 
         // Calculate fees (2% total: 1% platform, 1% creator)
-        let fee_bps = 200;
-        let total_fee = actual_cost * fee_bps / 10_000;
+        let fee_bps = 200u128; // ← Changed to u128
+        let total_fee = (actual_cost as u128 * fee_bps / 10_000u128) as u64; // ← Use u128 arithmetic
         let creator_fee = total_fee / 2;
         let platform_fee = total_fee - creator_fee;
         let net_to_vault = actual_cost - total_fee;
@@ -305,6 +391,7 @@ pub mod notty_smart_contract {
         // Calculate fees (2% total: 1% platform, 1% creator)
         let fee_bps = 200;
         let total_fee = sol_to_return * fee_bps / 10_000;
+
         let creator_fee = total_fee / 2;
         let platform_fee = total_fee - creator_fee;
         let net_to_seller = sol_to_return - total_fee;
@@ -538,10 +625,16 @@ impl BondingCurveVault {
 
         // Binary search to find optimal token amount within SOL budget
         let mut low = 1u64;
-        let mut high = std::cmp::min(
-            tokens_remaining,
-            max_sol * TOTAL_SUPPLY / END_MARKET_CAP_SOL,
-        );
+
+        // Use u128 to prevent overflow in the estimate calculation
+        let estimate_u128 = (max_sol as u128 * TOTAL_SUPPLY as u128) / END_MARKET_CAP_SOL as u128;
+        let estimate = if estimate_u128 > u64::MAX as u128 {
+            tokens_remaining // Cap at remaining tokens if estimate overflows
+        } else {
+            estimate_u128 as u64
+        };
+
+        let mut high = std::cmp::min(tokens_remaining, estimate);
         let mut best_tokens = 0u64;
         let mut best_cost = 0u64;
 
@@ -578,7 +671,8 @@ impl BondingCurveVault {
         let end_market_cap = self.get_market_cap_at_supply(end_tokens);
 
         let average_market_cap = (start_market_cap + end_market_cap) / 2;
-        let cost = (average_market_cap * token_amount) / TOTAL_SUPPLY;
+        let cost =
+            ((average_market_cap as u128 * token_amount as u128) / TOTAL_SUPPLY as u128) as u64;
 
         Ok(cost)
     }
@@ -596,7 +690,9 @@ impl BondingCurveVault {
         let end_market_cap = self.get_market_cap_at_supply(end_tokens);
 
         let average_market_cap = (start_market_cap + end_market_cap) / 2;
-        let return_amount = (average_market_cap * token_amount) / TOTAL_SUPPLY;
+        // Use u128 to prevent overflow in the multiplication
+        let return_amount =
+            ((average_market_cap as u128 * token_amount as u128) / TOTAL_SUPPLY as u128) as u64;
 
         Ok(return_amount)
     }
@@ -612,7 +708,75 @@ impl BondingCurveVault {
     }
 }
 
-// Keep existing TokenVault for backward compatibility
+#[derive(Accounts)]
+pub struct UpdateAdmin<'info> {
+    #[account(mut)]
+    pub current_admin: Signer<'info>,
+
+    #[account(
+        mut,
+        seeds = [GLOBAL_STATE_SEED],
+        bump
+    )]
+    pub global_state: Account<'info, GlobalState>,
+}
+
+#[derive(Accounts)]
+pub struct GetFeeVaultBalance<'info> {
+    #[account(
+        seeds = [FEE_VAULT_SEED],
+        bump
+    )]
+    /// CHECK: PDA fee vault
+    pub fee_vault: UncheckedAccount<'info>,
+}
+
+#[derive(Accounts)]
+pub struct Initialize<'info> {
+    #[account(mut)]
+    pub payer: Signer<'info>,
+
+    #[account(
+        init,
+        payer = payer,
+        space = 8 + std::mem::size_of::<GlobalState>(),
+        seeds = [GLOBAL_STATE_SEED],
+        bump
+    )]
+    pub global_state: Account<'info, GlobalState>,
+
+    #[account(
+        seeds = [FEE_VAULT_SEED],
+        bump
+    )]
+    /// CHECK: PDA to collect fees
+    pub fee_vault: UncheckedAccount<'info>,
+
+    pub system_program: Program<'info, System>,
+}
+
+#[derive(Accounts)]
+pub struct WithdrawFees<'info> {
+    #[account(mut)]
+    pub admin: Signer<'info>,
+
+    #[account(
+        seeds = [GLOBAL_STATE_SEED],
+        bump
+    )]
+    pub global_state: Account<'info, GlobalState>,
+
+    #[account(
+        mut,
+        seeds = [FEE_VAULT_SEED],
+        bump
+    )]
+    /// CHECK: PDA fee vault
+    pub fee_vault: UncheckedAccount<'info>,
+
+    pub system_program: Program<'info, System>,
+}
+
 #[account]
 pub struct TokenVault {
     pub mint: Pubkey,
@@ -658,6 +822,7 @@ pub struct CreateBondingCurveToken<'info> {
     pub token_vault: Account<'info, TokenAccount>,
 
     #[account(
+        mut,
         seeds = [SOL_VAULT_SEED, mint_account.key().as_ref()],
         bump
     )]
@@ -665,6 +830,7 @@ pub struct CreateBondingCurveToken<'info> {
     pub sol_vault: UncheckedAccount<'info>,
 
     #[account(
+        mut,
         seeds = [FEE_VAULT_SEED],
         bump
     )]
@@ -858,7 +1024,25 @@ pub struct VaultMigratedEvent {
     pub sol_deposited: u64,
 }
 
-// Updated error codes
+#[event]
+pub struct ProgramInitializedEvent {
+    pub admin: Pubkey,
+    pub fee_vault: Pubkey,
+}
+
+#[event]
+pub struct AdminUpdatedEvent {
+    pub old_admin: Pubkey,
+    pub new_admin: Pubkey,
+}
+
+#[event]
+pub struct FeesWithdrawnEvent {
+    pub admin: Pubkey,
+    pub amount: u64,
+    pub fee_vault_remaining: u64,
+}
+
 #[error_code]
 pub enum ErrorCode {
     #[msg("Not enough SOL to buy tokens")]
@@ -885,6 +1069,10 @@ pub enum ErrorCode {
     AlreadyGraduated,
     #[msg("Bonding curve has not graduated yet")]
     NotGraduated,
+    #[msg("Only admin can perform this action")]
+    UnauthorizedAdmin,
+    #[msg("Fee vault doesn't have enough balance")]
+    InsufficientFeeVaultBalance,
 }
 
 // Keep existing account structures for backward compatibility
