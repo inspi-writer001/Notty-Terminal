@@ -1,7 +1,5 @@
 #![allow(unexpected_cfgs)]
 
-use std::str::FromStr;
-
 use anchor_lang::prelude::*;
 use anchor_lang::solana_program::{program::invoke, system_instruction};
 use anchor_spl::associated_token::AssociatedToken;
@@ -15,6 +13,9 @@ use anchor_spl::token::{
 use anchor_spl::token_interface::{Mint as InterfaceMint, TokenInterface};
 use raydium_launch_cpi::states::*;
 use raydium_launch_cpi::{cpi, program::RaydiumLaunchpad};
+
+pub mod utils;
+use utils::helpers::*;
 
 pub const TOKEN_VAULT_SEED: &[u8] = b"token_vault";
 pub const SOL_VAULT_SEED: &[u8] = b"sol_vault";
@@ -233,6 +234,7 @@ pub mod notty_smart_contract {
 
         // 6. Initialize bonding curve vault
         let vault = &mut ctx.accounts.vault_account;
+        vault.initialize_curve_parameters();
         vault.mint = ctx.accounts.mint_account.key();
         vault.token_account = ctx.accounts.token_vault.key();
         vault.sol_vault = ctx.accounts.sol_vault.key();
@@ -270,21 +272,22 @@ pub mod notty_smart_contract {
         require!(!vault.graduated, ErrorCode::AlreadyGraduated);
 
         // Calculate how many tokens we can buy with max_sol_cost
-        let (tokens_to_buy, actual_cost) = vault.calculate_purchase(max_sol_cost)?;
+        let (tokens_to_buy, actual_cost_lamports) = vault.calculate_purchase(max_sol_cost)?;
+        let actual_cost_sol = actual_cost_lamports / 1_000_000_000; // For events only
 
         require!(tokens_to_buy >= min_tokens_out, ErrorCode::SlippageExceeded);
         require!(tokens_to_buy > 0, ErrorCode::InvalidAmount);
 
         // Calculate fees (2% total: 1% platform, 1% creator)
         let fee_bps = 200u128; // ← Changed to u128
-        let total_fee = (actual_cost as u128 * fee_bps / 10_000u128) as u64; // ← Use u128 arithmetic
+        let total_fee = (actual_cost_lamports as u128 * fee_bps / 10_000u128) as u64; // ← Use u128 arithmetic
         let creator_fee = total_fee / 2;
         let platform_fee = total_fee - creator_fee;
-        let net_to_vault = actual_cost - total_fee;
+        let net_to_vault = actual_cost_lamports - total_fee;
 
         // Check buyer has enough SOL
         require!(
-            ctx.accounts.buyer.lamports() >= actual_cost,
+            ctx.accounts.buyer.lamports() >= actual_cost_lamports,
             ErrorCode::InsufficientFunds
         );
 
@@ -365,7 +368,7 @@ pub mod notty_smart_contract {
             trade_type: 0, // Buy
             mint_address: ctx.accounts.mint.key(),
             user: ctx.accounts.buyer.key(),
-            sol_amount: actual_cost,
+            sol_amount: actual_cost_sol,
             token_amount: tokens_to_buy,
             new_token_price: vault.get_current_token_price(),
             market_cap: current_market_cap,
@@ -390,21 +393,25 @@ pub mod notty_smart_contract {
         );
 
         // Calculate SOL to return
-        let sol_to_return = vault.calculate_sell_return(token_amount)?;
+        let sol_to_return_lamports = vault.calculate_sell_return(token_amount)?;
+        let sol_to_return_sol = sol_to_return_lamports / 1_000_000_000;
 
-        require!(sol_to_return >= min_sol_out, ErrorCode::SlippageExceeded);
+        require!(
+            sol_to_return_lamports >= min_sol_out,
+            ErrorCode::SlippageExceeded
+        );
 
         // Calculate fees (2% total: 1% platform, 1% creator)
         let fee_bps = 200;
-        let total_fee = sol_to_return * fee_bps / 10_000;
+        let total_fee = sol_to_return_lamports * fee_bps / 10_000;
 
         let creator_fee = total_fee / 2;
         let platform_fee = total_fee - creator_fee;
-        let net_to_seller = sol_to_return - total_fee;
+        let net_to_seller = sol_to_return_lamports - total_fee;
 
         // Ensure vault has enough SOL
         require!(
-            ctx.accounts.sol_vault.lamports() >= sol_to_return,
+            ctx.accounts.sol_vault.lamports() >= sol_to_return_lamports,
             ErrorCode::VaultInsufficientSol
         );
 
@@ -457,7 +464,7 @@ pub mod notty_smart_contract {
 
         // Update vault state
         vault.tokens_sold -= token_amount;
-        vault.sol_raised -= sol_to_return; // Total SOL that left the vault
+        vault.sol_raised -= sol_to_return_lamports; // Total SOL that left the vault
 
         let current_market_cap = vault.calculate_current_market_cap();
 
@@ -465,7 +472,7 @@ pub mod notty_smart_contract {
             trade_type: 1, // Sell
             mint_address: ctx.accounts.mint.key(),
             user: ctx.accounts.seller.key(),
-            sol_amount: sol_to_return,
+            sol_amount: sol_to_return_sol,
             token_amount: token_amount,
             new_token_price: vault.get_current_token_price(),
             market_cap: current_market_cap,
@@ -600,135 +607,108 @@ pub struct BondingCurveVault {
     pub sol_raised: u64,
     pub graduated: bool,
     pub migrated: bool,
+    pub base_price: u64, // (in lamports/token)
+    pub slope: u64,      //  (in lamports/token²)
 }
 
 impl BondingCurveVault {
-    // Linear bonding curve pricing
+    pub fn initialize_curve_parameters(&mut self) {
+        // Market cap = price_per_token * total_supply
+        // So price_per_token = market_cap / total_supply
+
+        let start_price_lamports = START_MARKET_CAP_SOL
+            .checked_mul(1_000_000_000) // Convert SOL to lamports
+            .expect("Start market cap overflow")
+            .checked_div(TOTAL_SUPPLY)
+            .unwrap_or(1);
+
+        let end_price_lamports = END_MARKET_CAP_SOL
+            .checked_mul(1_000_000_000) // Convert SOL to lamports
+            .expect("End market cap overflow")
+            .checked_div(TOTAL_SUPPLY)
+            .unwrap_or(1);
+
+        // For linear curve: price(supply) = base_price + slope * supply
+        // At supply = 0: price = base_price (start_price)
+        // At supply = TOTAL_SUPPLY: price = base_price + slope * TOTAL_SUPPLY (end_price)
+        // Therefore: slope = (end_price - start_price) / TOTAL_SUPPLY
+
+        self.base_price = start_price_lamports;
+
+        let price_difference = end_price_lamports
+            .checked_sub(start_price_lamports)
+            .expect("End price must be greater than start price");
+
+        self.slope = price_difference.checked_div(TOTAL_SUPPLY).unwrap_or(1);
+
+        // Ensure minimum values to avoid zero prices
+        self.base_price = self.base_price.max(1);
+        self.slope = self.slope.max(1);
+    }
+
+    // Remove the unused calculate_slope function and update get_current_token_price:
     pub fn get_current_token_price(&self) -> u64 {
-        if self.tokens_sold == 0 {
-            return ((START_MARKET_CAP_SOL as u128 * 1_000_000_000) / TOTAL_SUPPLY as u128) as u64;
-        }
-
-        // Calculate where we are on the bonding curve (0.0 to 1.0)
-        let progress = (self.tokens_sold as f64) / (TOTAL_SUPPLY as f64);
-
-        // Linear interpolation between start and end market cap
-        let price_range = END_MARKET_CAP_SOL - START_MARKET_CAP_SOL;
-        let current_market_cap = START_MARKET_CAP_SOL + ((price_range as f64) * progress) as u64;
-
-        // Price per token = current_market_cap / TOTAL_SUPPLY (not tokens_sold!)
-        ((current_market_cap as u128 * 1_000_000_000) / TOTAL_SUPPLY as u128) as u64
+        // Price = base_price + slope * tokens_sold
+        self.base_price
+            .saturating_add(self.slope.saturating_mul(self.tokens_sold))
     }
 
     pub fn calculate_current_market_cap(&self) -> u64 {
-        if self.tokens_sold == 0 {
-            return START_MARKET_CAP_SOL;
-        }
-
-        let progress = (self.tokens_sold as f64) / (TOTAL_SUPPLY as f64);
-        let price_range = END_MARKET_CAP_SOL - START_MARKET_CAP_SOL;
-        START_MARKET_CAP_SOL + ((price_range as f64) * progress) as u64
+        // Market cap in SOL = (current_price * TOTAL_SUPPLY) / 1e9
+        let current_price = self.get_current_token_price();
+        let cap_lamports = current_price as u128 * TOTAL_SUPPLY as u128;
+        (cap_lamports / 1_000_000_000) as u64
     }
 
-    // pub fn calculate_purchase(&self, max_sol: u64) -> Result<(u64, u64)> {
-    //     let tokens_remaining = TOTAL_SUPPLY - self.tokens_sold;
-
-    //     // 🔍 DEBUG: Log purchase calculation
-    //     msg!("calculate_purchase - max_sol: {}", max_sol);
-    //     msg!(
-    //         "calculate_purchase - tokens_sold: {}, tokens_remaining: {}",
-    //         self.tokens_sold,
-    //         tokens_remaining
-    //     );
-
-    //     require!(tokens_remaining > 0, ErrorCode::SoldOut);
-
-    //     // Use u128 to prevent overflow in the estimate calculation
-    //     let estimate_u128 = (max_sol as u128 * TOTAL_SUPPLY as u128) / END_MARKET_CAP_SOL as u128;
-    //     let estimate = if estimate_u128 > u64::MAX as u128 {
-    //         tokens_remaining
-    //     } else {
-    //         estimate_u128 as u64
-    //     };
-
-    //     let mut high = std::cmp::min(tokens_remaining, estimate);
-    //     let mut low = 1u64;
-    //     let mut best_tokens = 0u64;
-    //     let mut best_cost = 0u64;
-
-    //     // 🔍 DEBUG: Log binary search range
-    //     msg!("Binary search - low: {}, high: {}", low, high);
-
-    //     while low <= high {
-    //         let mid = (low + high) / 2;
-    //         if let Ok(cost) = self.calculate_buy_cost(mid) {
-    //             msg!(
-    //                 "Binary search - mid: {}, cost: {}, max_sol: {}",
-    //                 mid,
-    //                 cost,
-    //                 max_sol
-    //             );
-    //             if cost <= max_sol {
-    //                 best_tokens = mid;
-    //                 best_cost = cost;
-    //                 low = mid + 1;
-    //             } else {
-    //                 high = mid - 1;
-    //             }
-    //         } else {
-    //             high = mid - 1;
-    //         }
-    //     }
-
-    //     // 🔍 DEBUG: Log final result
-    //     msg!(
-    //         "calculate_purchase RESULT - tokens: {}, cost: {}",
-    //         best_tokens,
-    //         best_cost
-    //     );
-
-    //     require!(best_tokens > 0, ErrorCode::InsufficientFunds);
-    //     Ok((best_tokens, best_cost))
-    // }
-
     pub fn calculate_purchase(&self, max_sol: u64) -> Result<(u64, u64)> {
-        let tokens_remaining = TOTAL_SUPPLY - self.tokens_sold;
-        require!(tokens_remaining > 0, ErrorCode::SoldOut);
+        let max_lamports = max_sol
+            .checked_mul(1_000_000_000)
+            .ok_or(ErrorCode::NumericalOverflow)?;
+        let tokens_remaining = TOTAL_SUPPLY
+            .checked_sub(self.tokens_sold)
+            .ok_or(ErrorCode::SoldOut)?;
 
-        msg!("calculate_purchase - max_sol: {}", max_sol);
-        msg!(
-            "calculate_purchase - tokens_sold: {}, tokens_remaining: {}",
-            self.tokens_sold,
-            tokens_remaining
-        );
-
-        // Binary search to find optimal token amount within SOL budget
-        let mut low = 1u64;
-
-        // 🛡️ SAFE: Use u128 to prevent overflow, then safely convert
-        let conservative_estimate_u128 = (max_sol as u128).saturating_mul(100_000u128);
-        let conservative_estimate = if conservative_estimate_u128 > u64::MAX as u128 {
-            tokens_remaining / 1000 // Fallback: max 0.1% of remaining supply
-        } else {
-            std::cmp::min(conservative_estimate_u128 as u64, tokens_remaining / 1000)
-        };
-
-        let mut high = std::cmp::min(tokens_remaining, conservative_estimate);
-
-        // 🛡️ EXTRA SAFETY: Ensure high is reasonable
-        if high == 0 {
-            high = std::cmp::min(1000u64, tokens_remaining);
+        if tokens_remaining == 0 {
+            return Err(ErrorCode::SoldOut.into());
         }
 
-        let mut best_tokens = 0u64;
-        let mut best_cost = 0u64;
+        // Better initial estimate for binary search
+        let current_price = self.get_current_token_price();
 
-        msg!("Binary search - low: {}, high: {}", low, high);
+        // For small amounts, use current price as estimate
+        // For larger amounts, be more conservative due to price impact
+        let rough_estimate = if max_lamports <= current_price.saturating_mul(1000) {
+            // Small purchase - current price is reasonable estimate
+            max_lamports.checked_div(current_price.max(1)).unwrap_or(1)
+        } else {
+            // Large purchase - use more conservative estimate
+            // Assume average price will be ~1.5x current price due to bonding curve
+            max_lamports
+                .checked_div(
+                    current_price
+                        .saturating_mul(3)
+                        .checked_div(2)
+                        .unwrap_or(current_price)
+                        .max(1),
+                )
+                .unwrap_or(1)
+        };
+
+        let mut high = std::cmp::min(tokens_remaining, rough_estimate);
+        let mut low = 1;
+        let mut best_tokens = 0;
+        let mut best_cost = 0;
+
+        // Ensure we have a valid range
+        if high == 0 {
+            high = 1;
+        }
 
         while low <= high {
-            let mid = (low + high) / 2;
-            if let Ok(cost) = self.calculate_buy_cost(mid) {
-                if cost <= max_sol {
+            let mid = low + (high - low) / 2;
+            if let Some(cost) = linear_buy_cost(self.base_price, self.slope, self.tokens_sold, mid)
+            {
+                if cost <= max_lamports {
                     best_tokens = mid;
                     best_cost = cost;
                     low = mid + 1;
@@ -736,61 +716,28 @@ impl BondingCurveVault {
                     high = mid - 1;
                 }
             } else {
+                // Overflow occurred, reduce search space
                 high = mid - 1;
             }
         }
 
-        require!(best_tokens > 0, ErrorCode::InsufficientFunds);
-        Ok((best_tokens, best_cost))
+        if best_tokens == 0 {
+            Err(ErrorCode::InsufficientFunds.into())
+        } else {
+            Ok((best_tokens, best_cost))
+        }
     }
 
+    /// For linear curve: cost = base_price * amount + slope * (end² - start²) / 2
     pub fn calculate_buy_cost(&self, token_amount: u64) -> Result<u64> {
         require!(
             self.tokens_sold + token_amount <= TOTAL_SUPPLY,
             ErrorCode::ExceedsSupply
         );
 
-        let start_tokens = self.tokens_sold;
-        let end_tokens = start_tokens + token_amount;
-
-        let start_market_cap = self.get_market_cap_at_supply(start_tokens);
-        let end_market_cap = self.get_market_cap_at_supply(end_tokens);
-
-        let average_market_cap = (start_market_cap + end_market_cap) / 2;
-        let cost =
-            ((average_market_cap as u128 * token_amount as u128) / TOTAL_SUPPLY as u128) as u64;
-
-        // 🚨 DEBUG: Show the calculation breakdown
-        // msg!("=== CALCULATE_BUY_COST DEBUG ===");
-        // msg!("token_amount: {}", token_amount);
-        // msg!("start_market_cap: {}", start_market_cap);
-        // msg!("end_market_cap: {}", end_market_cap);
-        // msg!("average_market_cap: {}", average_market_cap);
-        // msg!("TOTAL_SUPPLY: {}", TOTAL_SUPPLY);
-        // msg!("calculated cost: {}", cost);
-
-        Ok(cost)
+        linear_buy_cost(self.base_price, self.slope, self.tokens_sold, token_amount)
+            .ok_or(ErrorCode::NumericalOverflow.into())
     }
-
-    // pub fn calculate_buy_cost(&self, token_amount: u64) -> Result<u64> {
-    //     require!(
-    //         self.tokens_sold + token_amount <= TOTAL_SUPPLY,
-    //         ErrorCode::ExceedsSupply
-    //     );
-
-    //     let start_tokens = self.tokens_sold;
-    //     let end_tokens = start_tokens + token_amount;
-
-    //     // Linear curve integration: cost = (start_price + end_price) * amount / 2
-    //     let start_market_cap = self.get_market_cap_at_supply(start_tokens);
-    //     let end_market_cap = self.get_market_cap_at_supply(end_tokens);
-
-    //     let average_market_cap = (start_market_cap + end_market_cap) / 2;
-    //     let cost =
-    //         ((average_market_cap as u128 * token_amount as u128) / TOTAL_SUPPLY as u128) as u64;
-
-    //     Ok(cost)
-    // }
 
     pub fn calculate_sell_return(&self, token_amount: u64) -> Result<u64> {
         require!(
@@ -798,28 +745,12 @@ impl BondingCurveVault {
             ErrorCode::InsufficientTokensSold
         );
 
-        let start_tokens = self.tokens_sold;
-        let end_tokens = start_tokens - token_amount;
+        let refund_lamports =
+            linear_sell_refund(self.base_price, self.slope, self.tokens_sold, token_amount)
+                .ok_or(ErrorCode::NumericalOverflow)?;
 
-        let start_market_cap = self.get_market_cap_at_supply(start_tokens);
-        let end_market_cap = self.get_market_cap_at_supply(end_tokens);
-
-        let average_market_cap = (start_market_cap + end_market_cap) / 2;
-        // Use u128 to prevent overflow in the multiplication
-        let return_amount =
-            ((average_market_cap as u128 * token_amount as u128) / TOTAL_SUPPLY as u128) as u64;
-
-        Ok(return_amount)
-    }
-
-    fn get_market_cap_at_supply(&self, supply: u64) -> u64 {
-        if supply == 0 {
-            return START_MARKET_CAP_SOL;
-        }
-
-        let progress = (supply as f64) / (TOTAL_SUPPLY as f64);
-        let price_range = END_MARKET_CAP_SOL - START_MARKET_CAP_SOL;
-        START_MARKET_CAP_SOL + ((price_range as f64) * progress) as u64
+        // Convert to SOL
+        Ok(refund_lamports)
     }
 }
 
